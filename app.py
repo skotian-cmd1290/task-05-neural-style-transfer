@@ -2,11 +2,14 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import models, transforms
+import torchvision.models as models
+import torchvision.transforms as transforms
 from PIL import Image
 import numpy as np
 
-# ---------------- Page Config ----------------
+# -------------------------------
+# Streamlit Page Config
+# -------------------------------
 st.set_page_config(
     page_title="Neural Style Transfer",
     page_icon="🎨",
@@ -14,102 +17,133 @@ st.set_page_config(
 )
 
 st.title("🎨 Neural Style Transfer")
-st.write("Apply the artistic style of one image to the content of another using VGG19.")
+st.write("Apply the artistic style of one image to another using CNN-based feature extraction.")
 
-# ---------------- Image Loader ----------------
-def load_image(image, max_size=400):
-    image = Image.open(image).convert("RGB")
-    size = min(max(image.size), max_size)
+# -------------------------------
+# Device (CPU only for Streamlit)
+# -------------------------------
+device = torch.device("cpu")
+
+# -------------------------------
+# Image Loader
+# -------------------------------
+def load_image(image, max_size=256):
     transform = transforms.Compose([
-        transforms.Resize(size),
+        transforms.Resize(max_size),
         transforms.ToTensor()
     ])
+    image = Image.open(image).convert("RGB")
     image = transform(image).unsqueeze(0)
+    return image.to(device)
+
+# -------------------------------
+# Display Image
+# -------------------------------
+def tensor_to_image(tensor):
+    image = tensor.clone().detach().cpu().squeeze(0)
+    image = image.numpy().transpose(1, 2, 0)
+    image = np.clip(image, 0, 1)
     return image
 
-# ---------------- Gram Matrix ----------------
+# -------------------------------
+# Gram Matrix
+# -------------------------------
 def gram_matrix(tensor):
-    _, c, h, w = tensor.size()
-    tensor = tensor.view(c, h * w)
-    gram = torch.mm(tensor, tensor.t())
-    return gram
+    b, c, h, w = tensor.size()
+    features = tensor.view(c, h * w)
+    gram = torch.mm(features, features.t())
+    return gram / (c * h * w)
 
-# ---------------- VGG Model ----------------
-class VGGFeatures(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.vgg = models.vgg19(pretrained=True).features.eval()
-        self.layers = {
-            '0': 'conv1_1',
-            '5': 'conv2_1',
-            '10': 'conv3_1',
-            '19': 'conv4_1',
-            '21': 'conv4_2',
-            '28': 'conv5_1'
-        }
+# -------------------------------
+# Feature Extraction
+# -------------------------------
+def get_features(image, model):
+    layers = {
+        '0': 'conv1_1',
+        '5': 'conv2_1',
+        '10': 'conv3_1',
+        '19': 'conv4_1',
+        '21': 'conv4_2',  # content layer
+        '28': 'conv5_1'
+    }
 
-    def forward(self, x):
-        features = {}
-        for name, layer in self.vgg._modules.items():
-            x = layer(x)
-            if name in self.layers:
-                features[self.layers[name]] = x
-        return features
+    features = {}
+    x = image
 
-# ---------------- Style Transfer ----------------
-def run_style_transfer(content, style, steps=200, style_weight=1e6, content_weight=1):
-    model = VGGFeatures()
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if name in layers:
+            features[layers[name]] = x
+
+    return features
+
+# -------------------------------
+# Style Transfer Function (FIXED)
+# -------------------------------
+def run_style_transfer(content, style, steps=50, style_weight=1e5):
+    vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features.to(device).eval()
+
+    for param in vgg.parameters():
+        param.requires_grad = False
+
+    content_features = get_features(content, vgg)
+    style_features = get_features(style, vgg)
+
+    # ✅ Detach targets (IMPORTANT FIX)
+    with torch.no_grad():
+        content_target = content_features['conv4_2']
+        style_targets = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+
+    # Generated image (leaf tensor)
     generated = content.clone().requires_grad_(True)
 
-    optimizer = optim.Adam([generated], lr=0.01)
-
-    style_features = model(style)
-    content_features = model(content)
-    style_grams = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+    optimizer = optim.Adam([generated], lr=0.02)
 
     for step in range(steps):
-        gen_features = model(generated)
+        optimizer.zero_grad()
 
-        content_loss = torch.mean((gen_features['conv4_2'] - content_features['conv4_2']) ** 2)
+        generated_features = get_features(generated, vgg)
 
+        # Content loss
+        content_loss = torch.mean((generated_features['conv4_2'] - content_target) ** 2)
+
+        # Style loss
         style_loss = 0
-        for layer in style_grams:
-            gen_gram = gram_matrix(gen_features[layer])
-            style_gram = style_grams[layer]
+        for layer in style_targets:
+            gen_gram = gram_matrix(generated_features[layer])
+            style_gram = style_targets[layer]
             style_loss += torch.mean((gen_gram - style_gram) ** 2)
 
-        total_loss = content_weight * content_loss + style_weight * style_loss
-
-        optimizer.zero_grad()
+        total_loss = content_loss + style_weight * style_loss
         total_loss.backward()
         optimizer.step()
 
-        if step % 50 == 0:
-            st.write(f"Step {step}/{steps} — Loss: {total_loss.item():.2f}")
+    return generated
 
-    return generated.detach()
+# -------------------------------
+# UI
+# -------------------------------
+content_file = st.file_uploader("📸 Upload Content Image", type=["jpg", "png", "jpeg"])
+style_file = st.file_uploader("🖌️ Upload Style Image", type=["jpg", "png", "jpeg"])
 
-# ---------------- UI ----------------
-content_file = st.file_uploader("📷 Upload Content Image", type=["jpg", "png"])
-style_file = st.file_uploader("🎨 Upload Style Image", type=["jpg", "png"])
-
-steps = st.slider("🔁 Optimization Steps", 50, 300, 200)
+steps = st.slider("🔁 Number of Steps (higher = better, slower)", 20, 100, 50)
 
 if content_file and style_file:
-    content = load_image(content_file)
-    style = load_image(style_file)
+    content_img = load_image(content_file)
+    style_img = load_image(style_file)
 
-    st.subheader("Input Images")
     col1, col2 = st.columns(2)
-    col1.image(Image.open(content_file), caption="Content Image", use_column_width=True)
-    col2.image(Image.open(style_file), caption="Style Image", use_column_width=True)
+    with col1:
+        st.image(tensor_to_image(content_img), caption="Content Image", width=250)
+    with col2:
+        st.image(tensor_to_image(style_img), caption="Style Image", width=250)
 
     if st.button("✨ Generate Stylized Image"):
-        with st.spinner("Applying Neural Style Transfer..."):
-            output = run_style_transfer(content, style, steps=steps)
+        with st.spinner("Applying Neural Style Transfer... Please wait ⏳"):
+            output = run_style_transfer(content_img, style_img, steps=steps)
 
-        output_image = output.squeeze().permute(1, 2, 0).numpy()
-        output_image = np.clip(output_image, 0, 1)
+        st.success("Style Transfer Complete!")
+        st.image(tensor_to_image(output), caption="Stylized Output", use_container_width=True)
 
-        st.subheader("🎉 Stylized Output")
-        st.image(output_image, use_column_width=True)
+else:
+    st.info("Upload both content and style images to begin.")
